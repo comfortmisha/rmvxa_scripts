@@ -1,0 +1,427 @@
+#=============================================================================
+# Free Movement Script
+#-----------------------------------------------------------------------------
+# Allows for arbitrary off-grid player movement. Features:
+# Smoother player movement!
+# Smooth follower movement! (Like, we're talkin, Earthbound smooth)
+# Automatically round corners approached head-on!
+# Scripted/event movement unchanged, no need to change events!
+#-----------------------------------------------------------------------------
+# Main control constant: Game_Map::STEPS_PER_TILE ; sets the number of new
+# steps it takes to move one grid step.
+#-----------------------------------------------------------------------------
+# By comfort_misha (comfortmisha2@gmail.com)
+# Last Update 3/22/14
+# !!!!SEE WARNING BELOW!!!!
+#=============================================================================
+
+#=============================================================================
+# ALIASES
+#-----------------------------------------------------------------------------
+# Game_CharacterBase : init_public_members, moveto, update_move
+#=============================================================================
+# OVERRIDES
+#-----------------------------------------------------------------------------
+# Game_Map : x_with_direction, y_with_direction, round_x_with_direction
+#            round_y_with_direction
+# Game_CharacterBase : collide_with_events?, collide_with_vehicles?, passable?
+# Game_Character : move_straight, move_diagonal
+# Game_Player : collide?, start_map_event, move_by_input, movable?
+# Game_Follower : chase_preceding_character
+# Game_Followers : collide?
+#=============================================================================
+
+#=============================================================================
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#                              WARNING
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#
+#       THIS SCRIPT PROBABLY BREAKS THE "GATHER FOLLOWERS" EVENT !!
+#              (but really, who uses that thing anyways?)
+#
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#                              WARNING
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#=============================================================================
+
+#=============================================================================
+# Modifying Game_Map
+#-----------------------------------------------------------------------------
+# -Modifying *_with_direction methods to look forward ATOMIC_MOVEMENT_SIZE
+#  rather than a whole grid step (these methods are used everywhere to see
+#  what's ahead, e.g., for collision detection and for movement, so changing
+#  the step size here makes a global change to the movement grid)
+#=============================================================================
+class Game_Map
+  
+  STEPS_PER_TILE = 8
+  ATOMIC_MOVEMENT_SIZE = 1.0 / STEPS_PER_TILE
+  
+  def x_with_direction(x, d)
+    x + (d == 6 ? ATOMIC_MOVEMENT_SIZE : d == 4 ? -ATOMIC_MOVEMENT_SIZE : 0)
+  end
+
+  def y_with_direction(y, d)
+    y + (d == 2 ? ATOMIC_MOVEMENT_SIZE : d == 8 ? -ATOMIC_MOVEMENT_SIZE : 0)
+  end
+  
+  def round_x_with_direction(x, d)
+    round_x(x + (d == 6 ? ATOMIC_MOVEMENT_SIZE : d == 4 ?
+                                                  -ATOMIC_MOVEMENT_SIZE : 0))
+  end
+  
+  def round_y_with_direction(y, d)
+    round_y(y + (d == 2 ? ATOMIC_MOVEMENT_SIZE : d == 8 ?
+                                                  -ATOMIC_MOVEMENT_SIZE : 0))
+  end
+end
+
+#=============================================================================
+# Modifying Game_CharacterBase
+#-----------------------------------------------------------------------------
+# -Replacing grid position checks for passable / event trigger checks with
+#  bounding box collision checks
+# -Adding move_history to remember previous Game_Map::STEPS_PER_TILE positions
+#  of each character, right now only used to make smooth follower movement
+# -Modifying move_update for two step movement to round corners that are
+#  approached head on from a step to the side
+#=============================================================================
+class Game_CharacterBase
+  
+  attr_reader   :move_history # holds previous positions (for follower movement)
+  attr_accessor :width        # width of character bounding box
+  attr_accessor :height       # height of character bounding box
+  
+  alias old_init init_public_members
+  alias old_moveto moveto
+  def init_public_members
+    old_init
+    @move_history = []
+    
+    @width = 0.8
+    @height = 0.8
+    @input_movement = self.is_a?(Game_Event) ? false : true
+    
+    @reserved_move = nil
+  end
+  
+  # Initialize @move_history to the correct length with initial position
+  def moveto(x, y)
+    old_moveto(x,y)
+    @move_history = []
+    Game_Map::STEPS_PER_TILE.times do
+      @move_history.push [x,y]
+    end
+  end
+  
+  # Check collision between this box and box with origin
+  # at (x,y)
+  def bounding_box_collision?(x,y)
+    @x < x+@width-0.05 && @x > x-@width+0.05 &&
+    @y < y+@height-0.05 && @y > y-@height+0.05
+  end
+  
+  # Get tiles on grid that this box at (x,y) would lie on
+  def get_overlapping_tiles(x,y)
+    tiles = []
+    tiles[0] = [x.to_i, y.to_i]
+    tiles.push [(x+@width).to_i,y.to_i] unless x == x.to_i
+    tiles.push [x.to_i,(y+@height).to_i] unless y == y.to_i
+    tiles.push [(x+@width).to_i,(y+@height).to_i] unless
+                                              x == x.to_i || y == y.to_i
+    tiles
+  end
+  
+  def collide_with_events?(x, y)
+    $game_map.events.values.any? do |event|
+      (event.normal_priority? || self.is_a?(Game_Event)) &&
+      event != self && !event.through &&
+      event.bounding_box_collision?(x,y)
+    end
+  end
+  
+  def collide_with_vehicles?(x, y)
+    ($game_map.boat.bounding_box_collision?(x,y) && !$game_map.boat.through) ||
+    ($game_map.ship.bounding_box_collision?(x,y) && !$game_map.ship.through)
+  end
+  
+  def passable?(x, y, d)
+    x2 = $game_map.round_x_with_direction(x, d)
+    y2 = $game_map.round_y_with_direction(y, d)
+    # characters can now sit on multiple tiles, so we now have to check all
+    # possible tiles for collisions
+    tiles = get_overlapping_tiles(x,y)
+    tiles2 = get_overlapping_tiles(x2,y2)
+    return false if tiles2.any? {|n| !$game_map.valid?(n[0],n[1])}
+    return true if @through || debug_through?
+    return false if tiles.any? {|n| !map_passable?(n[0], n[1], d)}
+    return false if tiles2.any? {|n| !map_passable?(n[0], n[1], reverse_dir(d))}
+    return false if collide_with_characters?(x2, y2)
+    return true
+  end
+  
+  # Changes here are used in conjunction with changes in Game_Character's
+  # move_straight; there we set up a two step move when moving around corners
+  # that are a step away; here we enact the second step after the first finishes
+  alias old_update update_move
+  def update_move
+    old_update
+    if @x == @real_x && @y == @real_y && @reserved_move != nil
+      move_diagonal(@reserved_move[0],@reserved_move[1])
+      @reserved_move = nil
+    end
+  end
+  
+end
+
+#=============================================================================
+# Modifying Game_Character
+#-----------------------------------------------------------------------------
+# -Modifying move_straight and move_diagonal to remember past
+#  Game_Map::STEPS_PER_TILE positions
+# -Modifying move_straight to automatically round corners that are taken
+#  head on either from directly in front or from a step to the side
+# -Modifying move_diagonal to automatically change to straight movement
+#  when unable to move diagonally, basically following walls rather than
+#  sticking to them
+# -Modifying both methods to keep scripted/event movement to whole grid steps
+#  even with new off-grid movement
+#=============================================================================
+class Game_Character < Game_CharacterBase
+  
+  def move_straight(d, turn_ok = true)
+    # make a simple straight move if we can
+    @move_succeed = passable?(@x, @y, d)
+    if @move_succeed
+      set_direction(d)
+      @x = $game_map.round_x_with_direction(@x, d)
+      @y = $game_map.round_y_with_direction(@y, d)
+      @real_x = $game_map.x_with_direction(@x, reverse_dir(d))
+      @real_y = $game_map.y_with_direction(@y, reverse_dir(d))
+      increase_steps
+      # save current position to position history
+      @move_history.shift
+      @move_history.push [@x,@y]
+    elsif self.is_a?(Game_Player)
+      # for player movement...
+      # try to make a diagonal move around a corner we're in contact with
+      if [2,8].include?(d) && diagonal_passable?(@x, @y, 4, d)
+        move_diagonal(4,d)
+      elsif [2,8].include?(d) && diagonal_passable?(@x, @y, 6, d)
+        move_diagonal(6,d)
+      elsif [4,6].include?(d) && diagonal_passable?(@x, @y, d, 2)
+        move_diagonal(d,2)
+      elsif [4,6].include?(d) && diagonal_passable?(@x, @y, d, 8)
+        move_diagonal(d,8)
+      # lastly, try to make a two step move around a corner we're a step away from
+      else
+        if [2,8].include?(d)
+          tmp_x_l = $game_map.round_x_with_direction(@x, 4)
+          tmp_x_r = $game_map.round_x_with_direction(@x, 6)
+          if passable?(@x,@y,4) && diagonal_passable?(tmp_x_l, @y, 4, d)
+            move_straight(4)
+            @reserved_move = [4,d]
+          elsif passable?(@x,@y,6) && diagonal_passable?(tmp_x_r, @y, 6, d)
+            move_straight(6)
+            @reserved_move = [6,d]
+          elsif turn_ok
+            set_direction(d)
+            check_event_trigger_touch_front
+          end
+        elsif [4,6].include?(d)
+          tmp_y_d = $game_map.round_y_with_direction(@y, 2)
+          tmp_y_u = $game_map.round_y_with_direction(@y, 8)
+          if passable?(@x,@y,2) && diagonal_passable?(@x, tmp_y_d, d, 2)
+            move_straight(2)
+            @reserved_move = [d,2]
+          elsif passable?(@x,@y,8) && diagonal_passable?(@x, tmp_y_u, d, 8)
+            move_straight(8)
+            @reserved_move = [d,8]
+          elsif turn_ok
+            set_direction(d)
+            check_event_trigger_touch_front
+          end
+        end
+      end
+    elsif turn_ok
+      set_direction(d)
+      check_event_trigger_touch_front
+    end
+    # for event movement and scripted player/follower movement, make sure to
+    # move an entire tile per step
+    if !@input_movement || @move_route_forcing ||
+        (self.is_a?(Game_Follower) && $game_player.move_route_forcing)
+      (Game_Map::STEPS_PER_TILE-1).times do
+        @move_succeed = passable?(@x, @y, d)
+        if @move_succeed
+          @x = $game_map.round_x_with_direction(@x, d)
+          @y = $game_map.round_y_with_direction(@y, d)
+          increase_steps
+          @move_history.shift
+          @move_history.push [@x,@y]
+        elsif turn_ok
+          check_event_trigger_touch_front
+        end
+      end
+    end
+  end
+  
+  def move_diagonal(horz, vert)
+    @move_succeed = diagonal_passable?(x, y, horz, vert)
+    if @move_succeed
+      @x = $game_map.round_x_with_direction(@x, horz)
+      @y = $game_map.round_y_with_direction(@y, vert)
+      @real_x = $game_map.x_with_direction(@x, reverse_dir(horz))
+      @real_y = $game_map.y_with_direction(@y, reverse_dir(vert))
+      increase_steps
+      @move_history.shift
+      @move_history.push [@x,@y]
+    # if we're running diagonally up against a wall, just move along the wall
+    else
+      @move_succeed = passable?(x,y,horz)
+      if @move_succeed
+        move_straight(horz)
+      else
+        @move_succeed = passable?(x,y,vert)
+        if @move_succeed
+          move_straight(vert)
+        end
+      end
+    end
+    set_direction(horz) if @direction == reverse_dir(horz)
+    set_direction(vert) if @direction == reverse_dir(vert)
+    # for event movement and scripted player/follower movement, make sure to
+    # move an entire tile per step
+    if !@input_movement || @move_route_forcing ||
+        (self.is_a?(Game_Follower) && $game_player.move_route_forcing)
+      (Game_Map::STEPS_PER_TILE-1).times do
+        @move_succeed = diagonal_passable?(x, y, horz, vert)
+        if @move_succeed
+          @x = $game_map.round_x_with_direction(@x, horz)
+          @y = $game_map.round_y_with_direction(@y, vert)
+          increase_steps
+          @move_history.shift
+          @move_history.push [@x,@y]
+        else
+          @move_succeed = passable?(x,y,horz)
+          if @move_succeed
+            move_straight(horz)
+          else
+            @move_succeed = passable?(x,y,vert)
+            if @move_succeed
+              move_straight(vert)
+            end
+          end
+        end
+      end
+    end
+  end
+  
+end
+
+#=============================================================================
+# Modifying Game_Player
+#-----------------------------------------------------------------------------
+# -Modify collision/event trigger methods to use bounding box collision
+#  checks rather than grid position checks
+# -Adding diagonal movement to move_by_input
+# -Modifying movable? to allow player movement even if a message window is
+#  visible, as long as it is not blocking (busy?)
+#=============================================================================
+class Game_Player < Game_Character
+  
+  def collide?(x, y)
+    !@through && (bounding_box_collision?(x,y) || followers.collide?(x, y))
+  end
+  
+  def start_map_event(x, y, triggers, normal)
+    return if $game_map.interpreter.running?
+    $game_map.events.values.each do |event|
+      next if !event.bounding_box_collision?(x,y)
+      if event.trigger_in?(triggers) && event.normal_priority? == normal
+        event.start
+      end
+    end
+  end
+  
+  def move_by_input
+    return if !movable? || $game_map.interpreter.running?
+    dir = Input.dir8
+    if [2,4,6,8].include? dir
+      move_straight(dir)
+    elsif [1,3,7,9].include? dir
+      case dir
+        when 1
+          horz = 4
+          vert = 2
+        when 3 
+          horz = 6
+          vert = 2
+        when 7 
+          horz = 4
+          vert = 8
+        when 9 
+          horz = 6
+          vert = 8
+      end
+      move_diagonal(horz, vert)
+    end
+  end
+  
+  def movable?
+    return false if moving?
+    return false if @move_route_forcing || @followers.gathering?
+    return false if @vehicle_getting_on || @vehicle_getting_off
+    return false if $game_message.busy?
+    return false if vehicle && !vehicle.movable?
+    return true
+  end
+  
+end
+
+#=============================================================================
+# Modifying Game_Follower
+#-----------------------------------------------------------------------------
+# -Changing follower algorithm to use Game_CharacterBase.@move_history to
+#  determine where to go while following
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#                          WARNING
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#
+#             THIS PROBABLY BREAKS THE GATHER EVENT !!
+#
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#                          WARNING
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#=============================================================================
+class Game_Follower < Game_Character
+  
+  def chase_preceding_character
+    unless moving?
+      sx = distance_x_from(@preceding_character.move_history[0][0])#x)
+      sy = distance_y_from(@preceding_character.move_history[0][1])#y)
+      if sx != 0 && sy != 0
+        move_diagonal(sx > 0 ? 4 : 6, sy > 0 ? 8 : 2)
+      elsif sx != 0
+        move_straight(sx > 0 ? 4 : 6)
+      elsif sy != 0
+        move_straight(sy > 0 ? 8 : 2)
+      end
+    end
+  end
+  
+end
+
+#=============================================================================
+# Modifying Game_Followers
+#-----------------------------------------------------------------------------
+# -Replacing collions detection with bounding box collisions
+#=============================================================================
+class Game_Followers
+  
+  def collide?(x, y)
+    visible_folloers.any? {|follower|
+      follower.bounding_box_collision?(x, y)
+    }
+  end
+end
