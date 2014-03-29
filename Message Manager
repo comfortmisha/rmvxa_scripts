@@ -1,0 +1,910 @@
+#=============================================================================
+# Message Manager Script
+#-----------------------------------------------------------------------------
+# Allows the possibility of having multiple message windows by using new
+# escape characters in "Show Text" events. Also allows for new types of
+# windows, like ones that don't block, and ones that are permanent on a
+# particular map.
+#-----------------------------------------------------------------------------
+# Main control constants: Game_Message::(NUM_WINDOW_MESSAGES,
+# MESSAGE_DISTANCE_CRITERIA) (see descriptions below)
+#-----------------------------------------------------------------------------
+# New escape characters in text boxes:
+# \w[n] - specifies that the following text will go to message window # n (if
+#         this is not specifed, window # 0 will be used, BUT, no further options
+#         will be read). After this character, a sequence of the following
+#         escape characters, with no spaces, but in any order, is expected.
+# \x[n] - sets the x-coordinate of the window on a grid of 4 points along each
+#         dimension; so n=0 means x=0, n=1 means x=Graphics.width/4, etc
+# \y[n] - same as above for y-coordinate
+# \e[n] - alternatively to \x[n] and \y[n], you can specify an event id here
+#         to center the window on event # n (on the current map). The window
+#         will stay on top of the event, even if it changes position. The
+#         "event anchor" specified here is also used in the other options below.
+# \l[n] - the width of the window, calculated as Graphics.width / n
+# \h[n] - the height of the window, in lines
+# \m[n] - specifies the method of determining when the window gets closed
+#         when n = 0: normal message, and waits at end for player input
+#         when n = 1: similar to a normal message, with \^ at the end (doesn't
+#                     wait for player input to close)
+#         when n = 2: window closes when player is farther than MESSAGE_DISTANCE_CRITERIA
+#                     from event specified in \e[n]
+#         when n = 3: window closes when self-switch n specified in \s[n] is ON
+#                     (for event anchor)
+# \s[n] - self-switch for \m[3]
+# \b    - non-blocking window: this means that the player can move while this
+#         window is open, and things that check $game_message.busy? won't block
+# \k    - force to stay on screen; the window will stay entirely on screen, even
+#         if its event anchor leaves the screen; if the event comes back on screen
+#         the window will go back on top of the event
+# \p    - permanent window; the window never goes away; it can close with \m[2]
+#         and \m[3], but if the criteria is active again (e.g., the player gets
+#         close again to the event with \m[2]), it will reopen
+#-----------------------------------------------------------------------------
+# Note that if you don't specify any of the above in the text box, nothing is
+# changed from the default vanilla behavior (equivalent to \w[n]\m[0])
+# The safest way to use this script is probably just to mark each text box
+# with only one \w[n] and set of option flags before the text.
+# Some examples:
+# \w[0]\m[0](...text...)              | (window 0 is a default message window)
+# \w[1]\m[0]\l[2]\h[2](...text...)    | (window 1 is a smaller default message
+#                                     |   window)
+# \w[2]\m[1]\l[4]\h[1]\e[1]\p\b(...)  | (window 2 is a small permanent window
+#                                     |   that stays on forever on event # 1)
+# \w[3]\m[2]\l[4]\h[1]\e[1]\p\b\k(...)| (window 3 is a small permanent window
+#                                     |   on event 1, that stays completely on
+#                                     |   the screen, but closes if the player
+#                                     |   gets far from event 1)
+# \b should always be used when \p is used
+# Permanent windows constantly cycle through all of their text while active, and
+# they keep all text that is sent to them, so multiple text boxes with \w[n]\p(...)
+# will get saved in message window n and cycled through
+#-----------------------------------------------------------------------------
+# By comfort_misha (comfortmisha2@gmail.com)
+# Last Update 3/28/14
+#=============================================================================
+
+#=============================================================================
+# ALIASES
+#-----------------------------------------------------------------------------
+# Window_Message : initialize, input_pause
+# Game_Interpreter : command_101
+# Scene_Map : pre_transfer
+#=============================================================================
+# OVERRIDES
+#-----------------------------------------------------------------------------
+# Game_Message : initialize, visible=, visible, clear, add, has_text?, busy?,
+#                all_text
+# Window_Message : update_fiber, fiber_main, update_background, update_placement,
+#                  process_all_text, open_and_wait, close_and_wait,
+#                  process_input, wait, wait_for_one_character, text_continue?,
+#                  settings_changed?, new_page, new_line_x
+# Scene_Map : create_message_window, update
+#=============================================================================
+
+#=============================================================================
+# Modifying Game_Message
+#-----------------------------------------------------------------------------
+# -Adding lots of new structures to communicate between new control characters
+#  in "Show Text" event and collection of Window_Message 's (position, shape,
+#  blocking, forced stay on screen, permanent, method of closing, event anchor
+#  etc. for each window)
+# -The add method has grown from 1 line to 100 lines! It now parses incoming
+#  text for control characters pertinent to new control options for message
+#  windows, and sets the corresponding structures appropriately
+# -Redefined busy? to only block when we've received specifically blocking text
+#  (any text that isn't in a window specified with the \b flag), not just
+#  for any old text
+#=============================================================================
+class Game_Message
+  
+  # initial (and currently maximum) number of message windows to be created and
+  # maintained
+  NUM_WINDOW_MESSAGES = 10
+  # distance (in map grid units) for the m=2 criteria
+  MESSAGE_DISTANCE_CRITERIA = 5
+  
+  METHOD_INPUT    = 0b0001
+  METHOD_AUTO     = 0b0010
+  METHOD_DISTANCE = 0b0100
+  METHOD_SWITCH   = 0b1000
+  
+  attr_accessor :face_names
+  attr_accessor :face_indices
+  attr_accessor :backgrounds
+  attr_accessor :positions
+  attr_accessor :width
+  attr_accessor :height
+  attr_accessor :x
+  attr_accessor :y
+  attr_accessor :blocking
+  attr_accessor :force
+  attr_accessor :permanent
+  attr_accessor :method
+  attr_accessor :event
+  attr_accessor :dist_event
+  attr_accessor :switch
+  attr_accessor :continue
+  attr_accessor :curr_event
+  
+  def initialize
+    @texts = []
+    
+    @face_name = ""
+    @face_index = 0
+    @background = 0
+    @position = 2
+    @curr_event = -1
+    
+    @continue = false
+    
+    @push_items = {
+    :@texts => nil,
+    :@face_names => nil,
+    :@face_indices => nil,
+    :@backgrounds => nil,
+    :@positions => nil,
+    :@width => nil,
+    :@height => nil,
+    :@x =>  nil,
+    :@y => nil,
+    :@blocking => nil,
+    :@method => nil,
+    :@force => nil,
+    :@permanent => nil,
+    :@event => nil,
+    :@dist_event => nil,
+    :@switch => nil
+    }
+    
+    @visible = Array.new(NUM_WINDOW_MESSAGES,false)
+    @face_names = Array.new(NUM_WINDOW_MESSAGES,"")
+    @face_indices = Array.new(NUM_WINDOW_MESSAGES,0)
+    @backgrounds = Array.new(NUM_WINDOW_MESSAGES,0)
+    @positions = Array.new(NUM_WINDOW_MESSAGES,2)
+    
+    @index = 0
+    # width of message windows as 1/n of screen
+    @width = Array.new(NUM_WINDOW_MESSAGES,-1)
+    # height of message windows in lines
+    @height = Array.new(NUM_WINDOW_MESSAGES,-1)
+    @x = Array.new(NUM_WINDOW_MESSAGES,nil)
+    @y = Array.new(NUM_WINDOW_MESSAGES,nil)
+    # does the window block like the old default game messages (non-blocking
+    # windows allow the player to move while open)
+    @blocking = Array.new(NUM_WINDOW_MESSAGES,nil)
+    # defines criteria for when the window will close
+    # 0 : player input (like default message)
+    # 1 : closes automatically after message end (like when using \^)
+    # 2 : player distance from event anchor
+    # 3 : self-switch specified with \s on event anchor is on
+    # 4 : ???
+    @method = Array.new(NUM_WINDOW_MESSAGES,-1)
+    # force window to stay on-screen completely
+    @force = Array.new(NUM_WINDOW_MESSAGES,nil)
+    # window is permanent, stays on the map until a scene change or player
+    # transfer
+    # WARNING: you probably shouldn't make a permanent blocking window, unless
+    # you like to live dangerously (maybe this should be prevented...)
+    @permanent = Array.new(NUM_WINDOW_MESSAGES,nil)
+    # event that window should be located at; it sticks to that event like
+    # a fly to...well you know
+    @event = Array.new(NUM_WINDOW_MESSAGES,-1)
+    @dist_event = Array.new(NUM_WINDOW_MESSAGES,-1)
+    # each window now has its own text array
+    NUM_WINDOW_MESSAGES.times do
+      @texts.push Array.new
+    end
+    # self-switch to be used for window closing
+    @switch = Array.new(NUM_WINDOW_MESSAGES,"")
+    
+    clear
+  end
+  
+  # icky fix to changing the designed type of a variable with attr_accessor
+  # methods (to array), this was a great idea! \s
+  def visible=(vis)
+    @visible.each {|v| v=vis}
+  end
+  def visible
+    @visible.any? { |v| v }
+  end
+  def set_visible(i, v)
+    @visible[i] = v if i < @visible.length
+  end
+  
+  # clear some stuff
+  def clear(i=0)
+    if i==0
+      @choices = []
+      @choice_cancel_type = 0
+      @choice_proc = nil
+      @num_input_variable_id = 0
+      @num_input_digits_max = 0
+      @item_choice_variable_id = 0
+    end
+    @scroll_mode = false
+    @scroll_speed = 2
+    @scroll_no_fast = false
+    
+    @texts[i] = []
+    @face_names[i] = ""
+    @face_indices[i] = 0
+    @backgrounds[i] = 0
+    @positions[i] = 2
+    
+    @width[i] = -1
+    @height[i] = -1
+    @x[i] = nil
+    @y[i] = nil
+    @blocking[i] = nil
+    @method[i] = -1
+    @force[i] = nil
+    @permanent[i] = nil
+    @dist_event[i] = -1
+    @event[i] = -1
+    @switch[i] = ""
+  end
+  
+  def push
+    instance_variables.each do |varname|
+      if @push_items.has_key?(varname.to_sym)
+        @push_items[varname.to_sym] = []
+        instance_variable_get(varname).each do |t|
+          @push_items[varname.to_sym].push(safe_clone(t))
+        end
+      end
+    end
+  end
+  def pop
+    instance_variables.each do |varname|
+      if @push_items.has_key?(varname.to_sym)
+        next if @push_items[varname.to_sym] == nil
+        instance_variable_set(varname, [])
+        @push_items[varname.to_sym].each do |t|
+          instance_variable_get(varname).push(safe_clone(t))
+        end
+        @push_items[varname] = nil
+      end
+    end
+  end
+  
+  def safe_clone(obj)
+    begin
+      x = obj.clone
+      return x
+    rescue
+      return obj
+    end
+  end
+  
+  def add(text)
+    i = 0
+    last_i = i
+    reading_options = false
+    # @continue gets set at the start of a command_101 call in Game_Interpreter
+    # we're gonna assume that each new "Show Text" event grouping of text
+    # specifies its window # with \w[n]; otherwise it uses window # 0
+    @index = 0 if @continue == false
+    @continue = true
+    # character-by-character parsing of incoming text, porque no soy un
+    # hombre sabio
+    while i < text.length
+      if text[i,1] == '\\'
+        case text[i+1,1]
+        # \w[n] character - this specifies that we're adding to window # n
+        # I'd only put one of these at the top of each "Show Text" command,
+        # but hey, it's your funeral
+        when 'w'
+          reading_options = true
+          # OK, I'll try to save the previous text to the previous window, in
+          # case you're silly enough to put a \w in the middle of a line
+          if i > 0
+            @texts[@index].push(text[last_i,i-last_i])
+          end
+          text[i,text.length-i].scan(/\\w\[(\d+)\]/) do |s|
+            @index = s[0].to_i
+            i += s[0].length + 2
+            break
+          end
+          @face_names[@index] = @face_name
+          @face_indices[@index] = @face_index
+          @backgrounds[@index] = @background
+          @positions[@index] = @position
+          @dist_event[@index] = @curr_event
+        # \b character - means this window is NOT blocking; without a \b , the
+        # window behaves like the old message windows with regards to player
+        # movement (yes I know: "b" for NON blocking, them's the breaks)
+        when 'b'
+          @blocking[@index] = false if reading_options
+        # \k character - force the window to stay completely on screen, even
+        # if the event anchor goes off-screen
+        # don't even ask me why it's 'k'
+        # oh yeah, "keep", that's it
+        when 'k'
+          @force[@index] = true if reading_options
+        # \p character - the window is permanent, never going away (though it
+        # can close (and reopen) based on the \m method specified)
+        # I bet you think 'p' stands for 'permanent', it'd make sense right?
+        # well it doesn't stand for permanent
+        # I'll let you think about what it really stands for
+        when 'p'
+          @permanent[@index] = true if reading_options
+        # \s[n] character - self-switch on event anchor to use as a closing
+        # criteria (only used when m=3)
+        # fine, 's' stands for switch, you got me...or is it really "self"?
+        # hmm...
+        when 's'
+          if !reading_options
+            i += 2
+            next
+          end
+          text[i,text.length-i].scan(/\\s\[(\w)\]/) do |s|
+            @switch[@index] = s[0]
+            i += 3
+            break
+          end
+        when 'm'
+          if !reading_options
+            i += 2
+            next
+          end
+          @method[@index] = 0b0000
+          tmp = nil
+          text[i,11].scan(/\\m\[(\d+)((?:,\d+)*)\]/) {|s| tmp = s}
+          i += 1
+          while tmp != nil
+            i += 1 + tmp[0].length
+            case tmp[0].to_i
+            when 0
+              @method[@index] |= METHOD_INPUT
+            when 1
+              @method[@index] |= METHOD_AUTO
+            when 2
+              @method[@index] |= METHOD_DISTANCE
+            when 3
+              @method[@index] |= METHOD_SWITCH
+            end
+            tmp2 = nil
+            tmp[1].scan(/,(\d+)((?:,\d+)*)/) {|s| tmp2 = s }
+            tmp = tmp2
+          end
+        else
+          if ['e','l','h','x','y'].include?(text[i+1,1])
+            if !reading_options
+              i += 2
+              next
+            end
+            if text[i+1,1] == 'e' && text[i,7][/\\\w\[(-?\d+)\]/] == nil
+              @event[@index] = @curr_event
+            end
+            text[i,7].scan(/\\\w\[(-?\d+)\]/) do |s|
+              case text[i+1,1]
+              # event ID of event anchor
+              when 'e'
+                @event[@index] = s[0].to_i
+                @dist_event[@index] = @event[@index]
+              # I really wanted this one to be 'w', for 'width', but 'w' was
+              # already taken
+              # now it's 'l' for 'length', just doesn't have the same ring to it
+              # such is life
+              when 'l'
+                @width[@index] = s[0].to_i
+              when 'h'
+                @height[@index] = s[0].to_i
+              when 'x'
+                @x[@index] = s[0].to_i
+              when 'y'
+                @y[@index] = s[0].to_i
+              end
+              i += s[0].length + 2
+              break
+            end
+          else
+            last_i = i if reading_options
+            @blocking[@index] = true if @blocking[@index] == nil
+            @force[@index] = false if @force[@index] == nil
+            @permanent[@index] = false if @permanent[@index] == nil
+            @method[@index] = METHOD_INPUT if @method[@index] == -1
+            reading_options = false
+          end
+        end
+        i += 1
+      else
+        last_i = i if reading_options
+        @blocking[@index] = true if @blocking[@index] == nil
+        @force[@index] = false if @force[@index] == nil
+        @permanent[@index] = false if @permanent[@index] == nil
+        @method[@index] = METHOD_INPUT if @method[@index] == -1
+        reading_options = false
+      end
+      i += 1
+    end
+    @face_names[@index] = @face_name
+    @face_indices[@index] = @face_index
+    @backgrounds[@index] = @background
+    @positions[@index] = @position
+    @dist_event[@index] = @curr_event if @dist_event[@index] == -1
+    @texts[@index].push text[last_i,text.length-last_i]
+  end
+  
+  def has_blocking_text?
+    @blocking.any?{|n| n == true}
+  end
+  
+  def has_text?(i=0)
+    @texts[i].size > 0
+  end
+  
+  def busy?
+    has_blocking_text? || choice? || num_input? || item_choice?
+  end
+  
+  def all_text(i=0)
+    @texts[i].inject("") {|r, text| r += text + "\n"} if i < @texts.length
+  end
+  
+  def new_page(i=0)
+    @texts[i][-1] += "\f" if @texts.size > 0
+  end
+  
+end
+
+#=============================================================================
+# Modifying Window_Message
+#-----------------------------------------------------------------------------
+# -Modifying everything to allow for multiple message windows, indexed by
+#  the @index variable
+# -Expanding functionality to include different types of messages than the
+#  default single, blocking, pause for input message; we got permanent
+#  messages, non-blocking messages, messages that move around the screen,
+#  messages that turn on and off based on complex non-Euclidean geometry, we
+#  got em all!
+#  (OK, I lied, we don't have non-Euclidean geometry, just good old-fashioned
+#  Euclidean geometry...or maybe just a sufficiently negligible curvature...)
+#=============================================================================
+class Window_Message < Window_Base
+  
+  @@window_indices = Array.new(Game_Message::NUM_WINDOW_MESSAGES){|n| n}
+  
+  # label each window uniquely with a new index
+  alias old_init initialize
+  def initialize
+    return nil if @@window_indices.empty?
+    old_init
+    @index = @@window_indices.shift
+    # I honestly don't know what's up with this
+    # update 3/23: now I think I know what's up with this
+    self.arrows_visible = false
+    @forced_close = false
+    @text_block_done = false
+  end
+  
+  # currently choices/number input/item choice are only connected to window 0
+  def update_fiber
+    @forced_close = false
+    if @fiber
+      @fiber.resume(false)
+    elsif $game_message.has_text?(@index) && !$game_message.scroll_mode ||
+          (@index == 0 && ($game_message.choice? || $game_message.num_input? ||
+          $game_message.item_choice?))
+      @fiber = Fiber.new { fiber_main }
+      @fiber.resume
+    else
+      $game_message.set_visible(@index, false)
+    end
+  end
+  
+  # remember the old fiber_main ? it used to be so simple, so elegant
+  # then I came in and mucked it all up
+  # such is life
+  def fiber_main
+    @text_block_done = false
+    update_background
+    update_placement
+    # block for any texts that start off closed
+    @method = $game_message.method[@index]
+    while closing_criteria_met?
+      if Fiber.yield
+        cleanup
+        return
+      end
+    end
+    $game_message.set_visible(@index, true)
+    @blocking = $game_message.blocking[@index]
+    loop do
+      # permanent windows stay in here, they aren't allowed out
+      # what, segregation? no no no...you don't want permanent windows mixing
+      # with other kinds of windows
+      # they're SAVAGES
+      if $game_message.permanent[@index]
+        $game_message.set_visible(@index, false)
+        # permanent windows stay in here until they're closed
+        while !closing_criteria_met?
+          update_position
+          @text_block_done = false
+          process_all_text if $game_message.has_text?(@index)
+          return if @forced_close
+          process_input
+          @text_block_done = true
+          if Fiber.yield
+            cleanup
+            return
+          end
+        end
+        # afterwards, they go here to close down for the day
+        close_and_wait
+        return if @forced_close
+        # then they stay in here until their criteria is met again
+        while closing_criteria_met?
+          if Fiber.yield
+            cleanup
+            return
+          end
+        end
+        # a new day has begun!
+      else
+        # all mortal windows go through here
+        @text_block_done = false
+        process_all_text if $game_message.has_text?(@index)
+        return if @forced_close
+        process_input
+        @text_block_done = true
+        while !closing_criteria_met?
+          update_position
+          if Fiber.yield
+            cleanup
+            return
+          end
+        end
+        @gold_window.close if @index == 0
+        $game_message.clear(@index)
+        if Fiber.yield
+          cleanup
+          return
+        end
+        break unless text_continue?
+      end
+    end
+    #$game_message.clear(@index)
+    close_and_wait
+    $game_message.set_visible(@index, false)
+    @fiber = nil
+  end
+  
+  def cleanup
+    $game_message.clear(@index)
+    self.openness = 0
+    $game_message.set_visible(@index, false)
+    @fiber = nil
+    @forced_close = true
+  end
+  
+  def start_cleanup
+    @fiber.resume(true) if @fiber
+  end
+  
+  def update_background
+    @background = $game_message.backgrounds[@index]
+    self.opacity = @background == 0 ? 255 : 0
+  end
+  
+  # update the position for event-anchored windows
+  def update_position
+    if @gm_event >= 0 && $game_map.events[@gm_event]
+      @gm_ex = $game_map.events[@gm_event].real_x
+      # yeah that sounds about right
+      @gm_ex += (1-0.5*$game_map.events[@gm_event].width)
+      @gm_ey = $game_map.events[@gm_event].real_y
+      tmp_x = (@gm_ex-$game_map.display_x)*32 - width / 2.0
+      tmp_y = (@gm_ey-$game_map.display_y)*32 - height
+      if $game_message.force[@index]
+        tmp_x = 0 if tmp_x < 0
+        tmp_x = Graphics.width - width if tmp_x > Graphics.width - width
+        tmp_y = 0 if tmp_y < 0
+        tmp_y = Graphics.height - height if tmp_y > Graphics.height - height
+      end
+      self.x = tmp_x if self.x != tmp_x
+      self.y = tmp_y if self.y != tmp_y
+    end
+    if @gm_dist_event >= 0 && $game_map.events[@gm_dist_event]
+      @gm_dist_ex = $game_map.events[@gm_dist_event].real_x
+      @gm_dist_ex += (1-0.5*$game_map.events[@gm_dist_event].width)
+      @gm_dist_ey = $game_map.events[@gm_dist_event].real_y
+      @gm_dist_ey += (1-0.5*$game_map.events[@gm_dist_event].height)
+    end
+  end
+  
+  def update_placement
+    @position = $game_message.positions[@index]
+    @gm_width = $game_message.width[@index]
+    @gm_height = $game_message.height[@index]
+    @gm_event = $game_message.event[@index]
+    @gm_dist_event = $game_message.dist_event[@index]
+    @gm_x = $game_message.x[@index]
+    @gm_y = $game_message.y[@index]
+    if @gm_width > 0
+      self.width = Graphics.width / @gm_width
+    elsif @gm_event >= 0
+      self.width = Graphics.width / 4
+    else
+      self.width = Graphics.width
+    end
+    if @gm_height > 0
+      self.height = fitting_height(@gm_height)
+    elsif @gm_event >= 0
+      self.height = fitting_height(1)
+    else
+      self.height = fitting_height(visible_line_number)
+    end
+    # this part's important, the whole thing literally hinges on these two lines
+    contents.dispose
+    # no, ok, really, it's just this line that's important
+    create_contents
+    # ...hmmm....nothing happened, guess I'm thinking of a different part
+    if @gm_event >= 0 && $game_map.events[@gm_event]
+      update_position
+    elsif @gm_x != nil || @gm_y != nil
+      if @gm_x != nil
+        self.x = Graphics.width*(@gm_x/4.0)#@gm_x
+        # here's where that force flag really comes into play, here's it's time
+        # to shine...wait, it was used already farther up? darn...
+        if $game_message.force[@index]
+          self.x = 0 if self.x < 0
+          self.x = Graphics.width - width if self.x > Graphics.width - width
+        end
+      end
+      if @gm_y != nil
+        self.y = Graphics.height*(@gm_y/4.0)#@gm_y
+        if $game_message.force[@index]
+          self.y = 0 if self.y < 0
+          self.y = Graphics.height - height if self.y > Graphics.height - height
+        end
+      end
+    else
+      update_position
+      self.x = 0
+      self.y = @position * (Graphics.height - height) / 2
+    end
+  end
+  
+  # well, I wouldn't say that it processes *all* text...I mean, remember, those
+  # escape characters from before? yeah, it doesn't even KNOW about those
+  # things
+  # maybe I should just rename it process_most_text
+  def process_all_text
+    open_and_wait
+    return if @forced_close
+    text = convert_escape_characters($game_message.all_text(@index))
+    pos = {}
+    new_page(text, pos)
+    until text.empty? do
+      process_character(text.slice!(0, 1), text, pos)
+      # this allows the window to quickly close, e.g., when moving away from it
+      # cause, you know...some people care about that kind of thing
+      break if closing_criteria_met? || @forced_close
+    end
+  end
+  
+  def open_and_wait
+    open
+    until open? do
+      if Fiber.yield
+        cleanup
+        return
+      end
+      update_position
+    end
+  end
+  
+  def close_and_wait
+    close
+    until all_close? do
+      if Fiber.yield
+        cleanup
+        return
+      end
+      update_position
+    end
+  end
+  
+  def process_input
+    if @index == 0
+      if $game_message.choice?
+        input_choice
+      elsif $game_message.num_input?
+        input_number
+      elsif $game_message.item_choice?
+        input_item
+      else
+        input_pause unless @pause_skip
+      end
+    else
+      input_pause unless @pause_skip
+    end
+  end
+  
+  # we don't need no stinkin pauses when m!=0
+  #alias old_pause input_pause
+  def input_pause
+    return if @method & Game_Message::METHOD_INPUT == 0
+    self.pause = true
+    wait(10)
+    until Input.trigger?(:B) || Input.trigger?(:C) || closing_criteria_met?
+      update_position
+      if Fiber.yield
+        cleanup
+        break
+      end
+    end
+    Input.update
+    self.pause = false
+  end
+  
+  def wait(duration)
+    duration.times {
+      if Fiber.yield
+        cleanup
+        break
+      end
+      update_position
+      # let's skedaddle if shit goes down while we're waiting
+      break if closing_criteria_met?
+    }
+  end
+  
+  def wait_for_one_character
+    update_show_fast
+    if !((@show_fast && (@method&Game_Message::METHOD_INPUT != 0)) ||
+      @line_show_fast)
+      if Fiber.yield
+        cleanup
+        return
+      end
+      update_position
+    end
+  end
+  
+  # Nor this one
+  def settings_changed?
+    @background != $game_message.backgrounds[@index] ||
+    @position != $game_message.positions[@index] ||
+    @gm_width != $game_message.width[@index] ||
+    @gm_height != $game_message.height[@index] ||
+    @blocking != $game_message.blocking[@index] ||
+    @method != $game_message.method[@index]
+  end
+  
+  def closing_criteria_met?
+    if (@method & Game_Message::METHOD_INPUT != 0) ||
+      (@method & Game_Message::METHOD_AUTO != 0)
+      return true if @text_block_done && !$game_message.permanent[@index]
+    end
+    if @method & Game_Message::METHOD_DISTANCE != 0
+      if @gm_dist_event < 0
+        return true
+      else
+        sx = $game_player.distance_x_from(@gm_dist_ex).to_f
+        sy = $game_player.distance_y_from(@gm_dist_ey).to_f
+        dist = Math.sqrt(sx**2 + sy**2)
+        return true if dist > Game_Message::MESSAGE_DISTANCE_CRITERIA
+      end
+    end
+    # The self-switch stuff is untested
+    # Well, everything is, really, but this stuff is particularly untested
+    if @method & Game_Message::METHOD_SWITCH != 0
+      if @gm_event < 0 ||
+        !['A','B','C','D'].include?($game_message.switch[@index].upcase)
+        return true
+      else
+        key = [$game_map.map_id, @gm_event, $game_message.switch[@index].upcase]
+        return true if $game_self_switches[key]
+      end
+    end
+    return false
+  end
+  
+  def new_page(text,pos)
+    contents.clear
+    draw_face($game_message.face_names[@index], $game_message.face_indices[@index], 0, 0)
+    reset_font_settings
+    pos[:x] = new_line_x
+    pos[:y] = 0
+    pos[:new_x] = new_line_x
+    pos[:height] = calc_line_height(text)
+    clear_flags
+  end
+  
+  def new_line_x
+    $game_message.face_names[@index].empty? ? 0 : 112
+  end
+  
+  #def self.reset_count
+  #  @@window_count = 0
+  #end
+  
+  alias old_dispose dispose
+  def dispose
+    old_dispose
+    @@window_indices.push(@index).sort!
+  end
+  
+end
+
+#=============================================================================
+# Modifying Game_Interpreter
+#-----------------------------------------------------------------------------
+# -Literally the smallest possible modification one could make (see above for
+#  actual description)
+#=============================================================================
+class Game_Interpreter
+  alias old_command command_101
+  def command_101
+    $game_message.continue = false
+    $game_message.curr_event = @event_id
+    old_command
+    $game_message.continue = false
+  end
+end
+
+#=============================================================================
+# Modifying Scene_Map
+#-----------------------------------------------------------------------------
+# -Scene_Map now maintains an array of Window_Message 's rather than a single
+#  one
+#=============================================================================
+class Scene_Map < Scene_Base
+  
+  def create_message_window
+    if @init
+      @message_windows.each do |window|
+        window.show
+      end
+    else
+      $game_message.pop
+      @message_windows = []
+      Game_Message::NUM_WINDOW_MESSAGES.times do
+        @message_windows.push Window_Message.new
+      end
+    end
+    @init = true
+    @push_game_message = nil
+  end
+  
+  def update
+    super
+    @message_windows.each {|w| w.update}
+    $game_map.update(true)
+    $game_player.update
+    $game_timer.update
+    @spriteset.update
+    update_scene if scene_change_ok?
+    if SceneManager.scene.is_a?(Scene_Battle)
+      $game_message.push
+      @message_windows.each {|w| w.start_cleanup}
+      $game_message.continue = false
+    end
+  end
+  
+  alias old_transfer pre_transfer
+  def pre_transfer
+    old_transfer
+    @message_windows.each {|w| w.start_cleanup}
+  end
+  
+  def terminate
+    super
+    SceneManager.snapshot_for_background
+    if !SceneManager.scene.is_a?(Scene_Menu)
+      @message_windows.each {|window| window.dispose}
+      @init = false
+    else
+      @message_windows.each do |window|
+        window.hide
+      end
+    end
+    dispose_spriteset
+    perform_battle_transition if SceneManager.scene_is?(Scene_Battle)
+  end
+  
+end
