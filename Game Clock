@@ -1,4 +1,17 @@
 #=============================================================================
+# Game Clock
+#-----------------------------------------------------------------------------
+# -Adds in-game time (24 hour day); hour stored in variable # 
+#  Game_Clock::HOUR_VARIABLE_INDEX
+# -Applies screen tinting for dawn/daytime/sunset/night
+# -An extremely simple (for now) sprite thingy to display the current time (off
+#  by default for right now)
+#-----------------------------------------------------------------------------
+# By comfort_misha (comfortmisha2@gmail.com)
+# Last Update 3/22/14
+#=============================================================================
+
+#=============================================================================
 # ALIASES
 # Game_Map : setup
 # Scene_Map : update, post_transfer
