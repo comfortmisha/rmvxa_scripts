@@ -1,0 +1,62 @@
+#=============================================================================
+# Zelda-style scrolling script
+# by comfort_misha (comfortmisha2@gmail.com)
+# 3/22/2014
+#-----------------------------------------------------------------------------
+# Allows maps to have "Zelda-style" scrolling where the screen does not
+# scroll with the player until they reach the edge of the screen, at which
+# point it moves a whole screen in that direction
+# Main Parameters:
+# ZELDA_SCROLL_SPEED: sets the speed of the map scroll
+# ZELDA_MAP_IDS:      an array of map ids where Zelda scrolling is enabled
+#=============================================================================
+
+#=============================================================================
+# ALIASES
+#-----------------------------------------------------------------------------
+# Game_Player: initialize, update_scroll, moveto
+#=============================================================================
+# OVERRIDES
+#-----------------------------------------------------------------------------
+# (None)
+#=============================================================================
+
+ZELDA_SCROLL_SPEED = 7
+ZELDA_MAP_IDS = []
+
+class Game_Player < Game_Character
+  
+  alias misha_initialize initialize
+  def initialize
+    misha_initialize
+    @normal_scrolling = true
+  end
+  
+  alias misha_update_scroll update_scroll
+  def update_scroll(last_real_x, last_real_y)
+    x = $game_map.adjust_x(last_real_x)
+    y = $game_map.adjust_y(last_real_y)
+    
+    if @normal_scrolling
+      misha_update_scroll(last_real_x, last_real_y)
+    elsif !$game_map.scrolling?
+      if x < 0
+        $game_map.start_scroll(4, $game_map.screen_tile_x,ZELDA_SCROLL_SPEED)
+      elsif x+1 > $game_map.screen_tile_x
+        $game_map.start_scroll(6, $game_map.screen_tile_x,ZELDA_SCROLL_SPEED)
+      elsif y < 0
+        $game_map.start_scroll(8, $game_map.screen_tile_y,ZELDA_SCROLL_SPEED)
+      elsif y+1 > $game_map.screen_tile_y
+        $game_map.start_scroll(2, $game_map.screen_tile_y,ZELDA_SCROLL_SPEED)
+      end
+    end
+
+  end
+  
+  alias misha_moveto moveto
+  def moveto(x,y)
+    misha_moveto(x,y)
+    @normal_scrolling = !ZELDA_MAP_IDS.include?($game_map.map_id)
+  end
+  
+end
