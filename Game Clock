@@ -1,0 +1,268 @@
+#=============================================================================
+# ALIASES
+# Game_Map : setup
+# Scene_Map : update, post_transfer
+# DataManager : self.create_game_objects
+#
+# OVERRIDES
+# Scene_Map : post_start
+#=============================================================================
+
+class Game_Map
+  alias old_setup setup
+  
+  def setup(map_id)
+    old_setup(map_id)
+    
+    @map_extra_info = {}
+    @map.note.each_line {|a|
+      a.scan(/<\s*(\w+)\s*:\s*(\w+)\s*>/i)
+      if Regexp.last_match(1) && Regexp.last_match(2)
+        @map_extra_info[Regexp.last_match(1).downcase.to_sym] =
+                    Regexp.last_match(2)
+      end
+    }
+  end
+  
+  def is_inside?
+    return false if !@map_extra_info.has_key?(:inside)
+    @map_extra_info[:inside].downcase == "true"
+  end
+end
+
+class Game_Clock
+  # Constants
+  SECONDS_PER_HOUR = 5
+  FRAMES_PER_HOUR = Graphics.frame_rate * SECONDS_PER_HOUR
+  FRAMES_PER_DAY = 24 * FRAMES_PER_HOUR
+  
+  NORMAL_TONE = [0,0,0,0]
+  SUNSET_TONE = [68,-34,-34,0]
+  NIGHT_TONE = [-68,-68,0,68]
+  PREDAWN_TONE_INTERVAL = [136,34,-34,-68]
+  MORNING_TONE_INTERVAL = [-68,34,34,0]
+  SUNSET_TONE_INTERVAL = [68,-34,-34,0]
+  NIGHT_TONE_INTERVAL = [-136,-34,34,68]
+  
+  HOUR_VARIABLE_INDEX = 2
+  NIGHT_SWITCH_INDEX = 6
+  TIME_PASS_SWITCH_INDEX = 9
+  #INDOORS_SWITCH_INDEX = 10
+  
+  def initialize()
+    set_hour(0)
+  end
+  
+  def initialize(hour)
+    set_hour(hour)
+  end
+  
+  # Update time variable, tone settings if correct switches are present
+  def update
+    if time_passing?
+      time_pass
+      $game_switches[NIGHT_SWITCH_INDEX] = is_night?
+    end
+    
+    if !$game_map.is_inside?
+      new_tone = get_tone_for_time
+      $game_map.screen.start_tone_change(new_tone,0)
+    end
+  end
+  
+  def time_passing?
+    $game_switches[TIME_PASS_SWITCH_INDEX]
+  end
+  
+  def is_night?
+    @hour >= 20 || @hour <= 4
+  end
+  
+  # Update class variables for hour/frame of current day, as well as global
+  # variable for hour for use in events
+  def time_pass
+    @tod_frame = (@tod_frame+1) % FRAMES_PER_DAY
+    @hour = @tod_frame / FRAMES_PER_HOUR
+    $game_variables[HOUR_VARIABLE_INDEX] = @hour
+  end
+  
+  def get_tone_for_time
+    new_tone_arr = []
+    case @hour
+    when 4..5
+      left = 1.0 - ((6.0*FRAMES_PER_HOUR - @tod_frame) / (2.0*FRAMES_PER_HOUR))
+      for i in 0..3
+        new_tone_arr[i] = NIGHT_TONE[i] + PREDAWN_TONE_INTERVAL[i]*left
+      end
+    when 6..8
+      left = 1.0 - ((9.0*FRAMES_PER_HOUR - @tod_frame) / (3.0*FRAMES_PER_HOUR))
+      for i in 0..3
+        new_tone_arr[i] = SUNSET_TONE[i] + MORNING_TONE_INTERVAL[i]*left
+      end
+    when 9..14
+      new_tone_arr = [0,0,0,0]
+    when 15..17
+      left = 1.0 - ((18.0*FRAMES_PER_HOUR - @tod_frame) / (3.0*FRAMES_PER_HOUR))
+      for i in 0..3
+        new_tone_arr[i] = NORMAL_TONE[i] + SUNSET_TONE_INTERVAL[i]*left
+      end
+    when 18..20
+      left = 1.0 - ((21.0*FRAMES_PER_HOUR - @tod_frame) / (3.0*FRAMES_PER_HOUR))
+      for i in 0..3
+        new_tone_arr[i] = SUNSET_TONE[i] + NIGHT_TONE_INTERVAL[i]*left
+      end
+    else
+      new_tone_arr = [-68,-68,0,68]
+    end
+    return Tone.new(new_tone_arr[0], new_tone_arr[1], new_tone_arr[2],
+                            new_tone_arr[3])
+    end
+
+  # Manually set the time
+  def set_hour(new_hour)
+    @hour = new_hour
+    @tod_frame = @hour * FRAMES_PER_HOUR
+    $game_variables[HOUR_VARIABLE_INDEX] = @hour
+    $game_switches[NIGHT_SWITCH_INDEX] = is_night?
+  end
+  
+end
+
+#==============================================================================
+# Modifying Scene_Map for game time handling
+#
+# Modifications:
+# - Add constants related to time handling: length of an hour in-game, tone
+#   settings for various times, indices of pertinent switches/variables
+# - Hook time handling routine into update method:
+#     -Time passing controlled via switch # TIME_PASS_SWITCH_INDEX (default=9);
+#      this should be set automatically on each map where time passage is wanted
+#     -Current hour stored in @@hour and variable # HOUR_VARIABLE_INDEX (for use
+#      in custom event handling based on time)
+#     -Tone changes controlled via switch # INDOORS_SWITCH_INDEX (if false,
+#      then tone is smoothly changed in real time while in-game time passes)
+#     -Switch # NIGHT_SWITCH_INDEX is set from 8 PM until 4 AM in-game time, this
+#      can be used in custom events to change BGM/sounds during the night
+# - Manual singleton method added (self.set_hour) to manually set in-game time
+#==============================================================================
+class Scene_Map < Scene_Base
+  INDOORS_SWITCH_INDEX = 10
+  
+  # Hook in time handling
+  alias old_update update
+  alias old_post_transfer post_transfer  
+  
+  def post_start
+    do_inside_handling
+    super
+  end
+  
+  def update
+    $game_clock.update
+    old_update
+  end
+  
+  def post_transfer
+    do_inside_handling
+    old_post_transfer
+  end
+  
+  def do_inside_handling
+    if $game_map.is_inside?
+      $game_map.screen.start_tone_change(Tone.new,0)
+      $game_switches[INDOORS_SWITCH_INDEX] = true
+    else
+      $game_map.screen.start_tone_change($game_clock.get_tone_for_time,0)
+      $game_switches[INDOORS_SWITCH_INDEX] = false
+    end
+  end
+  
+end
+
+#==============================================================================
+# ** Sprite_Clock
+#------------------------------------------------------------------------------
+#  This sprite is for displaying the time of day
+#  $game_variables[3] = time of day in hour (24-hour format)
+#==============================================================================
+
+class Sprite_Clock < Sprite_Timer
+
+  #--------------------------------------------------------------------------
+  # * Update Transfer Origin Bitmap
+  #--------------------------------------------------------------------------
+  def update_bitmap
+    redraw
+  end
+
+  #--------------------------------------------------------------------------
+  # * Create Text
+  #--------------------------------------------------------------------------
+  def timer_text
+    sprintf("%02d:%02d", $game_variables[Game_Clock::HOUR_VARIABLE_INDEX], 0)
+  end
+  
+  def update_visibility
+    self.visible = false
+  end
+  
+  def update_position
+    super
+    self.x = 0
+  end
+  
+end
+
+class Spriteset_Map
+  alias old_initialize initialize
+  alias old_dispose dispose
+  alias old_update update
+  
+  def initialize
+    create_clock
+    old_initialize
+  end
+  
+  def dispose
+    dispose_clock
+    old_dispose
+  end
+  
+  def update
+    update_clock
+    old_update
+  end
+  
+  #--------------------------------------------------------------------------
+  # * Create Clock Sprite
+  #--------------------------------------------------------------------------
+  def create_clock
+    @clock_sprite = Sprite_Clock.new(@viewport2)
+  end
+  
+  #--------------------------------------------------------------------------
+  # * Free Clock Sprite
+  #--------------------------------------------------------------------------
+  def dispose_clock
+    @clock_sprite.dispose
+  end
+  
+  #--------------------------------------------------------------------------
+  # * Update Clock Sprite
+  #--------------------------------------------------------------------------
+  def update_clock
+    @clock_sprite.update
+  end
+  
+end
+
+module DataManager
+  class << self
+    alias old_create_game_objects create_game_objects
+    
+    def create_game_objects
+      old_create_game_objects
+      $game_clock = Game_Clock.new(12)
+    end
+  end
+end
