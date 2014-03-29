@@ -1,1 +1,1 @@
-My RPG Maker VX Ace scripts
+comfort_misha's RPG Maker VX Ace scripts
