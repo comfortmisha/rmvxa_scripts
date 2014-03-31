@@ -6,6 +6,11 @@
 # -Applies screen tinting for dawn/daytime/sunset/night
 # -An extremely simple (for now) sprite thingy to display the current time (off
 #  by default for right now)
+# -Maps can be specified as "inside" with the tag <inside: true> in the note;
+#  inside maps aren't affected by the day/night cycle tinting
+# -Time passing can be switched with switch # TIME_PASS_SWITCH_INDEX
+# -During night time the switch # NIGHT_SWITCH_INDEX is set, allowing for
+#  custom night-time events
 #-----------------------------------------------------------------------------
 # By comfort_misha (comfortmisha2@gmail.com)
 # Last Update 3/22/14
